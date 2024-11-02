@@ -4,7 +4,7 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .utils.graph_algorithms import warshall_algorithm, print_matrix
+from .utils.graph_algorithms import warshall_algorithm
 
 
 @extend_schema(responses={200: 'Success'}, summary="Warshall's Algorithm API",
