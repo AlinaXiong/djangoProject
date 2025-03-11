@@ -1,91 +1,133 @@
-def batch_insert(self, cursor, records, prefix):
-    """
-    Insert a batch of parsed log records into the database at one time,
-    using Oracle's batch error feature to handle conflicts in a single pass.
-    """
-    if not records:
-        return
+下面给你一个示例的 Python 工具类 (util)，利用 kafka-python 来向 Kafka 发送数据（Producer 角色）。你可以将此示例放到一个独立文件（如 kafka_util.py）中，然后在项目的其他部分直接调用它来发送消息。示例代码如下：
 
-    # 根据 prefix 决定表名的逻辑保持不变
-    if "PROD" in prefix:
-        insert_sql = """
-            INSERT INTO dsp_query_client_logs_prod
-            (
-                client_name, client_ip, server_name, environment, cache_name, region_name,
-                location, log_time, query_oql, app_id, data_source, type_field, target_field,
-                oql_size, duration, hint, success, process_time
-            )
-            VALUES
-            (
-                :client_name, :client_ip, :server_name, :environment, :cache_name, :region_name,
-                :location, TO_TIMESTAMP(:log_time, 'YYYY-MM-DD HH24:MI:SS'), :query_oql, :app_id,
-                :data_source, :type_field, :target_field, :oql_size, :duration, :hint, :success,
-                TO_TIMESTAMP(:process_time, 'YYYY-MM-DD HH24:MI:SS')
-            )
+python
+Copy
+Edit
+# kafka_util.py
+
+from kafka import KafkaProducer
+import json
+import logging
+
+class KafkaProducerUtil:
+    """
+    一个简单的 Kafka Producer 工具类。
+    使用 kafka-python 库进行消息发送。
+    """
+
+    def __init__(self,
+                 bootstrap_servers,
+                 client_id='my-producer',
+                 retries=3,
+                 acks='all',
+                 max_in_flight_requests_per_connection=5,
+                 key_serializer=None,
+                 value_serializer=None):
         """
-    else:
-        insert_sql = """
-            INSERT INTO dsp_query_client_logs
-            (
-                client_name, client_ip, server_name, environment, cache_name, region_name,
-                location, log_time, query_oql, app_id, data_source, type_field, target_field,
-                oql_size, duration, hint, success, process_time
-            )
-            VALUES
-            (
-                :client_name, :client_ip, :server_name, :environment, :cache_name, :region_name,
-                :location, TO_TIMESTAMP(:log_time, 'YYYY-MM-DD HH24:MI:SS'), :query_oql, :app_id,
-                :data_source, :type_field, :target_field, :oql_size, :duration, :hint, :success,
-                TO_TIMESTAMP(:process_time, 'YYYY-MM-DD HH24:MI:SS')
-            )
+        初始化一个 KafkaProducer 实例。
+
+        :param bootstrap_servers: Kafka 集群地址列表, 如 ["localhost:9092", "kafka2:9092"]
+        :param client_id: 用于标识客户端的 ID
+        :param retries: 发送失败时的重试次数
+        :param acks: 'all' 表示等待所有副本都收到才算成功, 可选: [0, 1, 'all']
+        :param max_in_flight_requests_per_connection: 并发 in-flight 请求数
+        :param key_serializer: key 的序列化函数，默认为 None
+        :param value_serializer: value 的序列化函数，默认为 None
         """
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+        # 如果用户没传序列化函数，则默认对字典进行 json.dumps
+        if value_serializer is None:
+            value_serializer = lambda v: json.dumps(v).encode('utf-8')
+
+        self.producer = KafkaProducer(
+            bootstrap_servers=bootstrap_servers,
+            client_id=client_id,
+            retries=retries,
+            acks=acks,
+            max_in_flight_requests_per_connection=max_in_flight_requests_per_connection,
+            key_serializer=key_serializer,
+            value_serializer=value_serializer,
+        )
+
+        self.logger.info(f"KafkaProducer created with servers={bootstrap_servers}, client_id={client_id}")
+
+    def send_message(self, topic, value, key=None, headers=None):
+        """
+        发送单条消息到指定 topic.
+
+        :param topic: 目标 topic 名称
+        :param value: 消息内容 (dict / str / bytes, 视value_serializer而定)
+        :param key: 消息 key (可选), 一般用于分区路由
+        :param headers: 可以传字典或元组列表, 例如: [("header_key", b"header_value")]
+        :return: KafkaProducer 的 Future 对象，可调用 get() 等方法阻塞等待发送结果
+        """
+        future = None
+        try:
+            future = self.producer.send(topic, key=key, value=value, headers=headers)
+            self.logger.debug(f"Message enqueued for topic={topic}, value={value}, key={key}")
+        except Exception as e:
+            self.logger.error(f"Failed to send message to Kafka: {e}", exc_info=True)
+            raise e
+        return future
+
+    def flush(self, timeout=None):
+        """
+        强制将本地缓冲区中的消息发送到 Kafka, 并等待完成.
+        :param timeout: 超时时间(秒). 若不指定, 则无限等待.
+        """
+        self.logger.info("Flushing Kafka producer buffer...")
+        self.producer.flush(timeout=timeout)
+        self.logger.info("Flush complete.")
+
+    def close(self):
+        """
+        关闭 Producer, 释放资源。
+        """
+        self.logger.info("Closing Kafka producer.")
+        self.producer.close()
+使用示例
+python
+Copy
+Edit
+# main.py (或其他调用代码)
+import logging
+from kafka_util import KafkaProducerUtil
+
+logging.basicConfig(level=logging.INFO)
+
+if __name__ == "__main__":
+    # 1) 初始化 Producer 工具
+    producer_util = KafkaProducerUtil(
+        bootstrap_servers=["localhost:9092"],
+        client_id="test-producer"
+    )
+
+    # 2) 构造要发送的内容
+    test_data = {
+        "region": "regionA",
+        "message": "Hello, Kafka!"
+    }
 
     try:
-        # --- 1) 批量插入 + batcherrors=True 开启批量错误模式 ---
-        #    注意：batcherrors=True 需要 Oracle 驱动支持，如 python-oracledb、cx_Oracle等
-        cursor.executemany(insert_sql, records, batcherrors=True)
-        
-        # --- 2) 收集所有 batch error ---
-        batch_errors = cursor.getbatcherrors()
-        
-        # 统计重复行和其他错误行
-        duplicates_count = 0
-        other_errors_count = 0
-        
-        for error in batch_errors:
-            # error.offset 是在当前 batch 中出错的第几行
-            # error.message 是数据库返回的错误信息
-            err_msg = str(error.message).upper()
-            if "ORA-00001" in err_msg or "UNIQUE CONSTRAINT" in err_msg:
-                # 说明是唯一键冲突
-                duplicates_count += 1
-            else:
-                # 其他错误（比如数据类型不匹配等）
-                other_errors_count += 1
-                self.logger.error(
-                    f"Row offset {error.offset} failed with error: {error.message}"
-                )
-
-        # --- 3) 成功行数 = 总行数 - 冲突行数 - 其他错误行数 ---
-        success_count = len(records) - duplicates_count - other_errors_count
-
-        # 在 batch error 模式下，Oracle 会插入所有能插入的行，只有出错的行被忽略或回滚
-        # 因此此时需要你决定：commit 还是 rollback
-        # 常见做法是 commit 成功部分，然后对冲突行做汇总日志
-        cursor.connection.commit()
-
-        # 只打一条汇总日志
-        if other_errors_count == 0:
-            self.logger.info(
-                f"Batch inserted {success_count} records; ignored {duplicates_count} duplicates."
-            )
-        else:
-            self.logger.warning(
-                f"Batch inserted {success_count} records; ignored {duplicates_count} duplicates; "
-                f"{other_errors_count} rows had other errors (check logs)."
-            )
+        # 3) 发送消息
+        future = producer_util.send_message(topic="test-topic", value=test_data)
+        #   可选择同步等待发送结果
+        record_metadata = future.get(timeout=10)
+        print("Message sent, topic:", record_metadata.topic,
+              "partition:", record_metadata.partition,
+              "offset:", record_metadata.offset)
 
     except Exception as e:
-        # 如果出现非批量错误模式可处理的情况或驱动不支持等，就走这里
-        self.logger.error(f"Error inserting data with batch error mode: {e}", exc_info=True)
-        raise
+        print("Error while sending message:", e)
+
+    finally:
+        # 4) 关闭前可选择 flush
+        producer_util.flush()
+        producer_util.close()
+说明
+安装依赖:
+bash
+Copy
+Edit
+pip install kafka-python
