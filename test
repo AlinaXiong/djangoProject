@@ -1,479 +1,91 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import os
-import re
-import time
-import shutil
-import logging
-import gzip
-import boto3
-
-from botocore.exceptions import NoCredentialsError, PartialCredentialsError
-from concurrent.futures import ThreadPoolExecutor
-
-###############################################################################
-# 模拟/示例：数据库连接器（你可以在生产环境中改为真实的 DB 连接）
-###############################################################################
-class DBConnector:
-    def __init__(self, db_name):
-        self.db_name = db_name
-
-    def get_connection(self):
-        """
-        这里返回一个模拟的数据库连接对象，内部只有一个 cursor()。
-        在真实环境，请自行使用 cx_Oracle / psycopg2 / pyodbc 等库返回真实连接。
-        """
-        return MockConnection()
-
-class MockConnection:
+def batch_insert(self, cursor, records, prefix):
     """
-    简化的示例 “数据库连接”，只有 cursor() 和 commit() 两个方法
+    Insert a batch of parsed log records into the database at one time,
+    using Oracle's batch error feature to handle conflicts in a single pass.
     """
-    def cursor(self):
-        return MockCursor()
+    if not records:
+        return
 
-    def commit(self):
-        pass
-
-class MockCursor:
-    """
-    简化的示例 “游标”，支持 execute() / executemany() / close()。
-    这里只是打印 SQL 和数据，不做真正的 DB 操作。
-    """
-    def execute(self, sql, params=None):
-        logging.getLogger(__name__).info(f"[MOCK] execute: {sql}\nParams: {params}")
-
-    def executemany(self, sql, params_seq):
-        logging.getLogger(__name__).info(f"[MOCK] executemany: {sql}\nNumber of records: {len(params_seq)}")
-
-    def close(self):
-        pass
-
-
-###############################################################################
-# 模拟/示例：获取当前环境信息（你可以在生产环境中改为真实实现）
-###############################################################################
-class EnvironmentLocator:
-    def get_environment_info(self, server_name):
-        """
-        根据服务器名返回环境信息的简单示例。
-        真实环境你可能会访问某个配置中心或映射表。
-        """
-        # 仅示例：如果 server_name 里带 "UAT" 就返回 "UAT"，
-        # 否则返回 "UNKNOWN"
-        if "UAT" in server_name.upper():
-            return {"ENV": "UAT"}
-        else:
-            return {"ENV": "UNKNOWN"}
-
-
-###############################################################################
-# 第一个类：IBMcosutils - 负责从 IBM COS (S3 接口) 下载文件
-###############################################################################
-class IBMcosutils:
-    @staticmethod
-    def download_file_from_ibm_cos(bucket_name, prefix, local_dir):
-        logger = logging.getLogger(__name__)
-        logger.info("Initializing IBM COS file download...")
-
-        # 证书示例路径，若不需要可改为 verify=False 或 verify=True
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        verify_path = os.path.join(current_dir, '..', 'cert', 'CitiInternalCAChain_PROD.pem')
-        logger.info(f"Certificate path: {verify_path}")
-
-        try:
-            s3_client = boto3.client(
-                's3',
-                aws_access_key_id='YOUR_ACCESS_KEY_ID',
-                aws_secret_access_key='YOUR_SECRET_ACCESS_KEY',
-                endpoint_url='https://your-endpoint-url',
-                verify=verify_path  
+    # 根据 prefix 决定表名的逻辑保持不变
+    if "PROD" in prefix:
+        insert_sql = """
+            INSERT INTO dsp_query_client_logs_prod
+            (
+                client_name, client_ip, server_name, environment, cache_name, region_name,
+                location, log_time, query_oql, app_id, data_source, type_field, target_field,
+                oql_size, duration, hint, success, process_time
             )
-            logger.info("S3 client initialized successfully.")
-        except Exception as e:
-            logger.error(f"Failed to initialize S3 client: {e}")
-            return
-
-        paginator = s3_client.get_paginator('list_objects_v2')
-        pages = paginator.paginate(Bucket=bucket_name, Prefix=prefix)
-
-        if not os.path.exists(local_dir):
-            os.makedirs(local_dir)
-            logger.info(f"Created local directory: {local_dir}")
-
-        for page in pages:
-            if 'Contents' in page:
-                for obj in page['Contents']:
-                    s3_key = obj['Key']
-                    # 跳过文件夹对象
-                    if s3_key.endswith('/'):
-                        logger.info(f"Skipping folder object: {s3_key}")
-                        continue
-
-                    # 计算本地文件路径
-                    relative_path = os.path.relpath(s3_key, prefix)
-                    local_file_path = os.path.join(local_dir, relative_path)
-                    local_file_dir = os.path.dirname(local_file_path)
-
-                    if not os.path.exists(local_file_dir):
-                        os.makedirs(local_file_dir, exist_ok=True)
-                        logger.info(f"Created directory for file: {local_file_dir}")
-
-                    try:
-                        logger.info(f"Starting download for {s3_key} to {local_file_path} ...")
-                        response = s3_client.get_object(Bucket=bucket_name, Key=s3_key)
-                        with open(local_file_path, 'wb') as f:
-                            for chunk in response['Body'].iter_chunks(chunk_size=512*1024):
-                                if chunk:
-                                    f.write(chunk)
-                        logger.info(f"Download completed for {s3_key}")
-                    except NoCredentialsError:
-                        logger.error("Unable to find valid AWS credentials, please check your configuration.")
-                        return
-                    except PartialCredentialsError:
-                        logger.error("Your credentials are incomplete, please complete them and try again.")
-                        return
-                    except Exception as e:
-                        logger.error(f"Download failed for {s3_key} with an error: {e}")
-                    finally:
-                        if 'response' in locals() and response and response['Body']:
-                            response['Body'].close()
-                            logger.info(f"Closed response stream for {s3_key}")
-
-        logger.info("All files processed successfully.")
-
-
-###############################################################################
-# 第二个类：DSPClientProcessor - 负责日志解析 & 数据库插入 (含优化)
-###############################################################################
-class DSPClientProcessor:
-    def __init__(self):
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.log_files = []
-        self.db_name = "ARK_UAT"
-
-        # ----------------------
-        # 预编译正则（优化要点1）
-        # ----------------------
-        self.pattern_success = re.compile(r"success\s+\[\S+?\]", re.IGNORECASE)
-
-        # 下面这些是 process_line 里要用到的多个正则，也在此处统一预编译
-        self.timestamp_pattern = re.compile(r"\[([\d-]+\s+[\d:]+\.\d+)\]")
-        self.client_info_pattern = re.compile(r"client\s*\[([\S]+)\]", re.IGNORECASE)
-        self.oql_pattern = re.compile(r"OQL\{(.*?)\}")
-        self.region_pattern = re.compile(r"region\s*\[([\S]+)\]", re.IGNORECASE)
-        self.app_info_pattern = re.compile(r"Application\s*\[\{([^\s:]+):\s*([^\]]+)\}\]", re.IGNORECASE)
-        self.type_pattern = re.compile(r"type\s*\[([\S]+)\]", re.IGNORECASE)
-        self.target_pattern = re.compile(r"target\s*\[([\S]+)\]", re.IGNORECASE)
-        self.size_pattern = re.compile(r"size\s*\[([\S]+)\]", re.IGNORECASE)
-        self.duration_pattern = re.compile(r"duration\s*\[([\S]+)\]", re.IGNORECASE)
-        self.hint_pattern = re.compile(r"hint\s*\[([\S]+)\]", re.IGNORECASE)
-        self.success_pattern = re.compile(r"Success\s*\[([\S]+)\]", re.IGNORECASE)
-
-    def process_log_file(self, log_file_path, location, server_name, prefix):
+            VALUES
+            (
+                :client_name, :client_ip, :server_name, :environment, :cache_name, :region_name,
+                :location, TO_TIMESTAMP(:log_time, 'YYYY-MM-DD HH24:MI:SS'), :query_oql, :app_id,
+                :data_source, :type_field, :target_field, :oql_size, :duration, :hint, :success,
+                TO_TIMESTAMP(:process_time, 'YYYY-MM-DD HH24:MI:SS')
+            )
         """
-        处理单个日志文件：
-        1) 如果是 .gz，解压后更新 log_file_path
-        2) 逐行拼接 & 检测 "success" 行 => 调用 process_line 解析
-        3) 批量插入数据库（优化要点2）
+    else:
+        insert_sql = """
+            INSERT INTO dsp_query_client_logs
+            (
+                client_name, client_ip, server_name, environment, cache_name, region_name,
+                location, log_time, query_oql, app_id, data_source, type_field, target_field,
+                oql_size, duration, hint, success, process_time
+            )
+            VALUES
+            (
+                :client_name, :client_ip, :server_name, :environment, :cache_name, :region_name,
+                :location, TO_TIMESTAMP(:log_time, 'YYYY-MM-DD HH24:MI:SS'), :query_oql, :app_id,
+                :data_source, :type_field, :target_field, :oql_size, :duration, :hint, :success,
+                TO_TIMESTAMP(:process_time, 'YYYY-MM-DD HH24:MI:SS')
+            )
         """
-        try:
-            # 如果是 gz 文件，先解压
-            if log_file_path.endswith('.gz'):
-                self.logger.info(f"Processing gzipped log file: {log_file_path}")
-                unzipped_file_path = log_file_path[:-3]  # 去掉 .gz
-                with gzip.open(log_file_path, mode='rb') as f_in, open(unzipped_file_path, 'wb') as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-                log_file_path = unzipped_file_path
 
-            # 获取数据库连接
-            connector = DBConnector(self.db_name)
-            connection = connector.get_connection()
-            cursor = connection.cursor()
-
-            self.logger.info(f"Processing log file: {log_file_path} in location: {location}")
-            file_name = os.path.basename(log_file_path)
-            parts = file_name.split("_")
-            cache_name = "_".join(parts[1:]) if len(parts) > 1 else ""
-
-            current_log = ""
-            records_buffer = []  # 用于批量缓存解析结果
-
-            # 读取日志文件逐行处理
-            with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as log_file:
-                for line in log_file:
-                    line = line.strip()
-                    # 判断该行是否包含完整的 success 信息
-                    if self.pattern_success.search(line):
-                        # 该行具备 success，说明之前的 current_log + 本行构成一个完整条目
-                        current_log += " " + line
-                        record = self.process_line(
-                            cursor,
-                            current_log.strip(),
-                            location,
-                            server_name,
-                            cache_name,
-                            prefix
-                        )
-                        if record:
-                            records_buffer.append(record)
-
-                        # 重置 current_log
-                        current_log = ""
-
-                        # 如果达到一定批量，就执行一次批量插入
-                        if len(records_buffer) >= 500:
-                            self.batch_insert(cursor, records_buffer, prefix)
-                            records_buffer.clear()
-
-                    else:
-                        # 日志行尚不完整，拼接到 current_log
-                        current_log += " " + line
-
-            # 处理最后可能残余的 current_log
-            if current_log.strip():
-                record = self.process_line(
-                    cursor,
-                    current_log.strip(),
-                    location,
-                    server_name,
-                    cache_name,
-                    prefix
+    try:
+        # --- 1) 批量插入 + batcherrors=True 开启批量错误模式 ---
+        #    注意：batcherrors=True 需要 Oracle 驱动支持，如 python-oracledb、cx_Oracle等
+        cursor.executemany(insert_sql, records, batcherrors=True)
+        
+        # --- 2) 收集所有 batch error ---
+        batch_errors = cursor.getbatcherrors()
+        
+        # 统计重复行和其他错误行
+        duplicates_count = 0
+        other_errors_count = 0
+        
+        for error in batch_errors:
+            # error.offset 是在当前 batch 中出错的第几行
+            # error.message 是数据库返回的错误信息
+            err_msg = str(error.message).upper()
+            if "ORA-00001" in err_msg or "UNIQUE CONSTRAINT" in err_msg:
+                # 说明是唯一键冲突
+                duplicates_count += 1
+            else:
+                # 其他错误（比如数据类型不匹配等）
+                other_errors_count += 1
+                self.logger.error(
+                    f"Row offset {error.offset} failed with error: {error.message}"
                 )
-                if record:
-                    records_buffer.append(record)
 
-            # 批量插入收尾
-            if records_buffer:
-                self.batch_insert(cursor, records_buffer, prefix)
-                records_buffer.clear()
+        # --- 3) 成功行数 = 总行数 - 冲突行数 - 其他错误行数 ---
+        success_count = len(records) - duplicates_count - other_errors_count
 
-            connection.commit()
-            self.logger.info(f"Successfully committed data for log file: {log_file_path}")
+        # 在 batch error 模式下，Oracle 会插入所有能插入的行，只有出错的行被忽略或回滚
+        # 因此此时需要你决定：commit 还是 rollback
+        # 常见做法是 commit 成功部分，然后对冲突行做汇总日志
+        cursor.connection.commit()
 
-        except Exception as e:
-            self.logger.error(f"Error processing log file [{log_file_path}]: {e}", exc_info=True)
-        finally:
-            try:
-                cursor.close()
-                connection.commit()
-            except:
-                pass
-
-    def process_line(self, cursor, line, location, server_name, cache_name, prefix):
-        """
-        用各种正则，解析一条完整的日志行，返回一个 dict 供批量插入。
-        """
-        # 获取环境信息
-        locator = EnvironmentLocator()
-        env_info = locator.get_environment_info(server_name)
-        env_value = env_info.get("ENV") if env_info else "UNKNOWN"
-
-        # 逐一匹配
-        timestamp_match = self.timestamp_pattern.search(line)
-        log_time_str = None
-        if timestamp_match:
-            try:
-                # 这里演示简单转换，更多复杂情况你可自行处理
-                log_time_str = timestamp_match.group(1)
-            except:
-                pass
-
-        client_info_match = self.client_info_pattern.search(line)
-        client_ip = client_name = None
-        if client_info_match:
-            # 假设 group(1) 是 client_ip, group(2) 是 client_name
-            # 但你的原代码可能不一样，要根据实际情况改
-            client_ip = client_info_match.group(1)
-            client_name = client_ip  # 简化示例
-
-        query_oql_match = self.oql_pattern.search(line)
-        query_oql = query_oql_match.group(1) if query_oql_match else None
-
-        region_match = self.region_pattern.search(line)
-        region_name = region_match.group(1) if region_match else None
-
-        app_info_match = self.app_info_pattern.search(line)
-        app_id = None
-        if app_info_match:
-            # group(1) => appKey, group(2) => appValue
-            app_id = app_info_match.group(1)
-
-        type_match = self.type_pattern.search(line)
-        type_field = type_match.group(1) if type_match else None
-
-        target_match = self.target_pattern.search(line)
-        target_field = target_match.group(1) if target_match else None
-
-        size_match = self.size_pattern.search(line)
-        qql_size = size_match.group(1) if size_match else None
-
-        duration_match = self.duration_pattern.search(line)
-        duration = duration_match.group(1) if duration_match else None
-
-        hint_match = self.hint_pattern.search(line)
-        hint = hint_match.group(1) if hint_match else None
-
-        success_match = self.success_pattern.search(line)
-        success = success_match.group(1) if success_match else None
-
-        # process_time（当前时间）
-        process_time = time.strftime("%Y-%m-%d %H:%M:%S")
-
-        # 组装记录 dict
-        record = {
-            "client_name": client_name,
-            "client_ip": client_ip,
-            "server_name": server_name,
-            "environment": env_value,
-            "cache_name": cache_name,
-            "region_name": region_name,
-            "location": location,
-            "log_time": log_time_str,
-            "query_oql": query_oql,
-            "app_id": app_id,
-            "data_source": "DSP_QUERY_LOG",
-            "type_field": type_field,
-            "target_field": target_field,
-            "qql_size": qql_size,
-            "duration": duration,
-            "hint": hint,
-            "success": success,
-            "process_time": process_time
-        }
-        return record
-
-    def batch_insert(self, cursor, records, prefix):
-        """
-        将一批解析好的日志记录一次性插入数据库
-        """
-        if not records:
-            return
-        # 根据 prefix 决定写哪个表
-        if "PROD" in prefix:
-            insert_sql = """
-                INSERT INTO dsp_query_client_logs_prod
-                (client_name, client_ip, server_name, environment, cache_name,
-                 region_name, location, log_time, query_oql, app_id,
-                 data_source, type_field, target_field, qql_size, duration,
-                 hint, success, process_time)
-                VALUES
-                (:client_name, :client_ip, :server_name, :environment, :cache_name,
-                 :region_name, :location, TO_TIMESTAMP(:log_time, 'YYYY-MM-DD HH24:MI:SS'),
-                 :query_oql, :app_id, :data_source, :type_field, :target_field,
-                 :qql_size, :duration, :hint, :success, TO_TIMESTAMP(:process_time, 'YYYY-MM-DD HH24:MI:SS'))
-            """
-        else:
-            insert_sql = """
-                INSERT INTO dsp_query_client_logs
-                (client_name, client_ip, server_name, environment, cache_name,
-                 region_name, location, log_time, query_oql, app_id,
-                 data_source, type_field, target_field, qql_size, duration,
-                 hint, success, process_time)
-                VALUES
-                (:client_name, :client_ip, :server_name, :environment, :cache_name,
-                 :region_name, :location, TO_TIMESTAMP(:log_time, 'YYYY-MM-DD HH24:MI:SS'),
-                 :query_oql, :app_id, :data_source, :type_field, :target_field,
-                 :qql_size, :duration, :hint, :success, TO_TIMESTAMP(:process_time, 'YYYY-MM-DD HH24:MI:SS'))
-            """
-
-        # 执行批量插入
-        try:
-            cursor.executemany(insert_sql, records)
-            logging.getLogger(__name__).info(f"Batch-inserted {len(records)} records.")
-        except Exception as e:
-            # 模拟：如果 e.args[0].code == 1 就是重复记录
-            # 这里仅示例处理
-            logging.getLogger(__name__).error(f"Error inserting batch data: {e}")
-            raise
-
-    def extract_dsp_client_info(self, prefix):
-        """
-        1) 下载对应 prefix 的日志文件
-        2) 遍历本地目录，收集日志文件路径
-        3) 用线程池并发处理
-        4) 清理临时目录
-        """
-        global_local_directory = os.path.join(os.getcwd(), f"tmp_dsp_download_{prefix}")
-        bucket_name = "ratesdata.logs"
-
-        self.logger.info(f"Starting DSP client log extraction with prefix: {prefix}")
-        self.logger.info(f"Local directory will be: {global_local_directory}")
-
-        # 先下载
-        try:
-            IBMcosutils.download_file_from_ibm_cos(
-                bucket_name=bucket_name,
-                prefix=prefix,
-                local_dir=global_local_directory
+        # 只打一条汇总日志
+        if other_errors_count == 0:
+            self.logger.info(
+                f"Batch inserted {success_count} records; ignored {duplicates_count} duplicates."
             )
-        except Exception as e:
-            self.logger.error(f"Error while downloading files from IBM COS: {e}", exc_info=True)
-            raise e
+        else:
+            self.logger.warning(
+                f"Batch inserted {success_count} records; ignored {duplicates_count} duplicates; "
+                f"{other_errors_count} rows had other errors (check logs)."
+            )
 
-        start_time = time.time()
-
-        # 遍历目录，收集日志文件列表
-        try:
-            for region_folder in os.listdir(global_local_directory):
-                region_folder_path = os.path.join(global_local_directory, region_folder)
-                if os.path.isdir(region_folder_path):
-                    derived_ems_folder = os.path.join(region_folder_path, 'DSP_Query_log')
-                    if os.path.exists(derived_ems_folder) and os.path.isdir(derived_ems_folder):
-                        for folder_name in os.listdir(derived_ems_folder):
-                            folder_path = os.path.join(derived_ems_folder, folder_name)
-                            if os.path.isdir(folder_path):
-                                server_name = folder_name.split("_")[0]
-                                for log_file_name in os.listdir(folder_path):
-                                    log_file_path = os.path.join(folder_path, log_file_name)
-                                    self.log_files.append((log_file_path, region_folder, server_name, prefix))
-        except Exception as e:
-            self.logger.error(f"Error while processing local directories: {e}", exc_info=True)
-            raise e
-
-        # 并发处理
-        max_workers = 5
-        self.logger.info(f"Starting log processing with {max_workers} workers.")
-        try:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [
-                    executor.submit(self.process_log_file, *log_file_info)
-                    for log_file_info in self.log_files
-                ]
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception as e:
-                        self.logger.error(f"Error during log file processing: {e}", exc_info=True)
-        except Exception as e:
-            self.logger.error(f"Error while using ThreadPoolExecutor: {e}", exc_info=True)
-            raise e
-
-        total_time = time.time() - start_time
-        self.logger.info(f"All DSP client log files processed. Total time taken: {total_time:.2f} seconds.")
-
-        # 最后清理临时目录（如果想保留下载结果，可注释此段）
-        try:
-            if os.path.exists(global_local_directory):
-                shutil.rmtree(global_local_directory)
-                self.logger.info(f"Cleaned up temporary directory: {global_local_directory}")
-        except Exception as e:
-            self.logger.error(f"Error while cleaning up temporary directory: {e}", exc_info=True)
-
-
-###############################################################################
-# 主入口示例
-###############################################################################
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
-    )
-    processor = DSPClientProcessor()
-
-    # 示例：给定一个 prefix
-    prefix = "20250301_UAT_LOG"
-
-    # 主流程：下载 + 解析 + 数据库写入
-    processor.extract_dsp_client_info(prefix)
+    except Exception as e:
+        # 如果出现非批量错误模式可处理的情况或驱动不支持等，就走这里
+        self.logger.error(f"Error inserting data with batch error mode: {e}", exc_info=True)
+        raise
