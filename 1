@@ -1,22 +1,22 @@
 public void fetchAndInsertDSPQueryClientLogs(String env) {
-    clientLogMapper.createView(env);
-
-    // 1. 查询所有 client_name + region_name 的组合
     List<Map<String, String>> clientRegionPairs = clientLogMapper.selectDistinctClientRegion(env);
+    clientLogMapper.deleteAllClientLogResults(env); // 清空旧记录
 
-    int batchSize = 200;
-    int count = 0;
+    int threadCount = 8; // 你可以根据机器性能设定线程数
+    ExecutorService executor = Executors.newFixedThreadPool(threadCount);
 
-    try (SqlSession sqlSession = sqlSessionTemplate.getSqlSessionFactory().openSession(false)) {
-        for (Map<String, String> pair : clientRegionPairs) {
-            String clientName = pair.get("clientName");
-            String regionName = pair.get("regionName");
+    List<Future<?>> futures = new ArrayList<>();
 
-            // 2. 根据每对 clientName + regionName 查询详细日志数据
-            List<DSPQueryClientInfo> allRecords =
-                clientLogMapper.selectLogsByClientAndRegion(env, clientName, regionName);
+    for (Map<String, String> pair : clientRegionPairs) {
+        futures.add(executor.submit(() -> {
+            String clientName = pair.get("CLIENTNAME");
+            String regionName = pair.get("REGIONNAME");
 
-            for (DSPQueryClientInfo data : allRecords) {
+            try (SqlSession sqlSession = sqlSessionTemplate.getSqlSessionFactory().openSession(false)) {
+                DSPQueryClientInfo data = clientLogMapper.selectLogsByClientAndRegion(env, clientName, regionName);
+
+                if (data == null) return;
+
                 DSPQueryClientInfoResult clientData = new DSPQueryClientInfoResult();
 
                 clientData.setClientName(data.getClientName() != null ? data.getClientName() : "defaultClientName");
@@ -27,7 +27,9 @@ public void fetchAndInsertDSPQueryClientLogs(String env) {
                 clientData.setRegionName(data.getRegionName() != null ? data.getRegionName() : "defaultRegionName");
                 clientData.setLocation(data.getLocation() != null ? data.getLocation() : "defaultLocation");
 
-                Timestamp logTime = data.getLogTime() != null ? data.getLogTime() : new Timestamp(System.currentTimeMillis());
+                Timestamp logTime = data.getLogTime() != null
+                        ? data.getLogTime()
+                        : new Timestamp(System.currentTimeMillis());
                 clientData.setLogTime(logTime);
 
                 clientData.setQueryQql(data.getQueryQql() != null ? data.getQueryQql() : "defaultQueryQql");
@@ -40,27 +42,31 @@ public void fetchAndInsertDSPQueryClientLogs(String env) {
                 clientData.setHint1(data.getHint1() != null ? data.getHint1() : "defaultHint1");
                 clientData.setSuccess(data.getSuccess() != null ? data.getSuccess() : "defaultSuccess");
 
-                Timestamp processTime = data.getProcessTime() != null ? data.getProcessTime() : new Timestamp(System.currentTimeMillis());
+                Timestamp processTime = data.getProcessTime() != null
+                        ? data.getProcessTime()
+                        : new Timestamp(System.currentTimeMillis());
                 clientData.setProcessTime(processTime);
 
                 clientData.setUpdateTime(new Timestamp(System.currentTimeMillis()));
 
                 clientLogMapper.insertClientLogResults(env, clientData);
-                count++;
 
-                if (count % batchSize == 0) {
-                    sqlSession.commit();
-                    log.info("Committed {} rows to the database.", batchSize);
-                }
+                sqlSession.commit();
+            } catch (Exception e) {
+                log.error("Error processing clientName: {}, regionName: {}, error: {}", clientName, regionName, e.getMessage(), e);
             }
-        }
-
-        sqlSession.commit();
-    } catch (DuplicateKeyException e) {
-        log.warn("Duplicate key exception: {}", e.getMessage());
-    } catch (Exception e) {
-        log.error("Exception in fetchAndInsertDSPQueryClientLogs:", e);
+        }));
     }
 
-    log.info("Total inserted: {}", count);
+    // 等待所有线程执行完毕
+    for (Future<?> future : futures) {
+        try {
+            future.get(); // 会抛出异常或等待任务完成
+        } catch (Exception e) {
+            log.error("Thread task failed: {}", e.getMessage(), e);
+        }
+    }
+
+    executor.shutdown();
+    log.info("All client logs processed and inserted.");
 }
