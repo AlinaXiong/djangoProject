@@ -1,0 +1,66 @@
+public void fetchAndInsertDSPQueryClientLogs(String env) {
+    clientLogMapper.createView(env);
+
+    // 1. 查询所有 client_name + region_name 的组合
+    List<Map<String, String>> clientRegionPairs = clientLogMapper.selectDistinctClientRegion(env);
+
+    int batchSize = 200;
+    int count = 0;
+
+    try (SqlSession sqlSession = sqlSessionTemplate.getSqlSessionFactory().openSession(false)) {
+        for (Map<String, String> pair : clientRegionPairs) {
+            String clientName = pair.get("clientName");
+            String regionName = pair.get("regionName");
+
+            // 2. 根据每对 clientName + regionName 查询详细日志数据
+            List<DSPQueryClientInfo> allRecords =
+                clientLogMapper.selectLogsByClientAndRegion(env, clientName, regionName);
+
+            for (DSPQueryClientInfo data : allRecords) {
+                DSPQueryClientInfoResult clientData = new DSPQueryClientInfoResult();
+
+                clientData.setClientName(data.getClientName() != null ? data.getClientName() : "defaultClientName");
+                clientData.setClientIp(data.getClientIp() != null ? data.getClientIp() : "defaultClientIp");
+                clientData.setEnvironment(data.getEnvironment() != null ? data.getEnvironment() : "defaultEnvironment");
+                clientData.setServerName(data.getServerName() != null ? data.getServerName() : "defaultServerName");
+                clientData.setCacheName(data.getCacheName() != null ? data.getCacheName() : "defaultCacheName");
+                clientData.setRegionName(data.getRegionName() != null ? data.getRegionName() : "defaultRegionName");
+                clientData.setLocation(data.getLocation() != null ? data.getLocation() : "defaultLocation");
+
+                Timestamp logTime = data.getLogTime() != null ? data.getLogTime() : new Timestamp(System.currentTimeMillis());
+                clientData.setLogTime(logTime);
+
+                clientData.setQueryQql(data.getQueryQql() != null ? data.getQueryQql() : "defaultQueryQql");
+                clientData.setAppId(data.getAppId() != null ? data.getAppId() : "defaultAppId");
+                clientData.setDataSource(data.getDataSource() != null ? data.getDataSource() : "defaultDataSource");
+                clientData.setTarget(data.getTarget() != null ? data.getTarget() : "defaultTarget");
+                clientData.setType(data.getType() != null ? data.getType() : "defaultType");
+                clientData.setQo1Size(data.getQo1Size() != null ? data.getQo1Size() : "defaultQo1Size");
+                clientData.setDuration(data.getDuration() != null ? data.getDuration() : "defaultDuration");
+                clientData.setHint1(data.getHint1() != null ? data.getHint1() : "defaultHint1");
+                clientData.setSuccess(data.getSuccess() != null ? data.getSuccess() : "defaultSuccess");
+
+                Timestamp processTime = data.getProcessTime() != null ? data.getProcessTime() : new Timestamp(System.currentTimeMillis());
+                clientData.setProcessTime(processTime);
+
+                clientData.setUpdateTime(new Timestamp(System.currentTimeMillis()));
+
+                clientLogMapper.insertClientLogResults(env, clientData);
+                count++;
+
+                if (count % batchSize == 0) {
+                    sqlSession.commit();
+                    log.info("Committed {} rows to the database.", batchSize);
+                }
+            }
+        }
+
+        sqlSession.commit();
+    } catch (DuplicateKeyException e) {
+        log.warn("Duplicate key exception: {}", e.getMessage());
+    } catch (Exception e) {
+        log.error("Exception in fetchAndInsertDSPQueryClientLogs:", e);
+    }
+
+    log.info("Total inserted: {}", count);
+}
